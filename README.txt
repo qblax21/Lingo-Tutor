@@ -11,3 +11,13 @@ Lingo Tutor - free, runs on your own PC
    set your language, Save.
 
 Nothing leaves your computer and there is no cost.
+
+--- Local voice (optional, already set up on this PC) ---
+Whisper (listening) and Piper (speaking) run from voice-venv, which start.bat uses automatically.
+To rebuild it:
+  C:\Users\Owner\miniconda3\python.exe -m venv voice-venv
+  voice-venv\Scripts\python.exe -m pip install -r requirements-voice.txt
+Piper voices go in the voices folder (.onnx + .onnx.json), e.g. de_DE-thorsten-high, pt_PT-tugao-medium.
+Download more from https://huggingface.co/rhasspy/piper-voices (the filename starts with the language code,
+e.g. fr_FR-..., es_ES-..., it_IT-...). Whisper downloads itself on first use (about 1.6 GB).
+Settings > Voice switches back to the browser's built-in voice.

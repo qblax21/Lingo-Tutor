@@ -1,0 +1,5 @@
+faster-whisper
+av>=14,<17
+piper-tts
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

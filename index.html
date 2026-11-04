@@ -51,6 +51,11 @@
 <main>
   <section id="view-settings" class="hidden">
     <div class="card">
+      <label>Voice (listening and speaking)</label>
+      <select id="voiceEngine">
+        <option value="local">Local — Whisper + Piper (better, needs the PC server)</option>
+        <option value="browser">Browser built-in</option>
+      </select>
       <label>AI provider</label>
       <select id="provider">
         <option value="ollama">Local model (Ollama) — free</option>
@@ -134,7 +139,7 @@ async function pull() {
 }
 
 let cfg = Object.assign(
-  { autoSend:true, pauseSecs:3, provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
+  { voiceEngine:'local', autoSend:true, pauseSecs:3, provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
   load('cfg', {}));
 let history = load('history', []);   // {role, content} for the API
 let cards = load('cards', []);       // {front, back, box, due}
@@ -211,6 +216,15 @@ function renderAI(obj) {
     }
     box.appendChild(w);
   }
+  if (obj.reply) {   // tap to hear it again
+    const h = document.createElement('div');
+    h.className = 'words';
+    const b = document.createElement('span');
+    b.textContent = '🔊 Listen';
+    b.onclick = () => { unlockAudio(); speak(obj.reply); };
+    h.appendChild(b);
+    box.appendChild(h);
+  }
   addMsg('ai', obj.reply, box);
   if (talkMode && obj.reply) speak(obj.reply);
 }
@@ -219,11 +233,89 @@ function renderAI(obj) {
 const LANGS = { spanish:'es-ES', french:'fr-FR', german:'de-DE', italian:'it-IT', portuguese:'pt-BR', japanese:'ja-JP',
   korean:'ko-KR', chinese:'zh-CN', mandarin:'zh-CN', russian:'ru-RU', arabic:'ar-SA', hindi:'hi-IN', dutch:'nl-NL',
   turkish:'tr-TR', polish:'pl-PL', swedish:'sv-SE', greek:'el-GR', english:'en-US' };
-const langCode = () => LANGS[cfg.target.toLowerCase()] || 'en-US';
+Object.assign(LANGS, { deutsch:'de-DE', espanol:'es-ES', francais:'fr-FR', italiano:'it-IT', nederlands:'nl-NL', portugues:'pt-PT', portugu:'pt-PT' });
+const langCode = () => {   // forgiving: "Europeu Portugues", "Deutsch", "pt-PT" ...
+  const s = cfg.target.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+  if (/braz/.test(s)) return 'pt-BR';
+  if (/^[a-z]{2}-[a-z]{2}$/.test(s)) return s.slice(0, 3) + s.slice(3).toUpperCase();
+  const k = Object.keys(LANGS).find(k => s.includes(k));
+  return k ? LANGS[k] : 'en-US';
+};
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let talkMode = false, rec = null, wantListen = false, spoken = '', silenceTimer;
 
-function speak(text) {
+// ---- local voice (Whisper listens, Piper speaks) when server.py has it; otherwise the browser's own ----
+let voice = { local:false }, lr = null;   // lr = the local recording in progress
+const localMode = () => voice.local && cfg.voiceEngine !== 'browser';
+const player = new Audio();
+const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+const unlockAudio = () => { player.src = SILENT; player.play().catch(() => {}); };   // iOS only lets audio play after a tap
+
+function speak(text) { localMode() ? speakLocal(text) : speakBrowser(text); }
+async function speakLocal(text) {
+  try {
+    const r = await fetch('/tts', { method:'POST', body:JSON.stringify({ text, lang:cfg.target }) });
+    if (!r.ok) throw new Error((await r.json()).error);
+    player.src = URL.createObjectURL(await r.blob());
+    player.onended = () => { if (talkMode) listen(); };
+    await player.play();
+  } catch (e) { $('status').textContent = String(e.message || e) + ' — using the browser voice instead.'; speakBrowser(text); }
+}
+
+async function listenLocal() {
+  wantListen = true; $('status').textContent = '';
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio:true }); }
+  catch (e) {
+    wantListen = false; setMic(false); talkMode = false; syncTalk();
+    $('status').textContent = 'Mic unavailable: ' + (e.name || e) + ' (needs https:// or localhost, and mic permission)';
+    return;
+  }
+  if (!wantListen) { stream.getTracks().forEach(t => t.stop()); return; }   // cancelled while the permission prompt was up
+  const mr = new MediaRecorder(stream), chunks = [];
+  mr.ondataavailable = e => chunks.push(e.data);
+  const ctx = new (window.AudioContext || window.webkitAudioContext)(), an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Float32Array(an.fftSize);
+  const st = lr = { stream, mr, chunks, ctx, started:Date.now(), noise:0.01, spoke:false, lastVoice:0, timer:0 };
+  st.timer = setInterval(() => {   // volume-based "are they talking" check
+    an.getFloatTimeDomainData(buf);
+    let s = 0; for (const v of buf) s += v * v;
+    const rms = Math.sqrt(s / buf.length), now = Date.now();
+    if (now - st.started < 500) st.noise = Math.min(0.03, Math.max(st.noise, rms));   // learn the room's background level
+    else if (rms > Math.max(0.02, st.noise * 2.5)) { if (!st.spoke) setMic(true, '🎤 Hearing you…'); st.spoke = true; st.lastVoice = now; }
+    if (st.spoke && cfg.autoSend && now - st.lastVoice > cfg.pauseSecs * 1000) finishLocal(true);
+    else if (!st.spoke && now - st.started > 30000) finishLocal(false);   // nobody spoke: reset
+  }, 100);
+  mr.start(); setMic(true);
+}
+function cancelLocal() {
+  if (!lr) return;
+  clearInterval(lr.timer);
+  lr.mr.onstop = null; try { lr.mr.stop(); } catch {}
+  lr.stream.getTracks().forEach(t => t.stop()); lr.ctx.close(); lr = null;
+}
+async function finishLocal(thenSend) {
+  const st = lr; if (!st) return;
+  lr = null; wantListen = false; clearInterval(st.timer);
+  await new Promise(res => { st.mr.onstop = res; try { st.mr.stop(); } catch { res(); } });
+  st.stream.getTracks().forEach(t => t.stop()); st.ctx.close(); setMic(false);
+  if (!st.spoke) { if (talkMode) setTimeout(listen, 300); return; }
+  $('status').textContent = 'Transcribing…';
+  try {
+    const r = await fetch('/stt?lang=' + encodeURIComponent(cfg.target), { method:'POST', body:new Blob(st.chunks, { type:st.mr.mimeType }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    $('status').textContent = '';
+    const text = (d.text || '').trim();
+    if (!text) { if (talkMode) listen(); return; }
+    $('input').value = ($('input').value + ' ' + text).trim();
+    if (thenSend) send();
+  } catch (e) { $('status').textContent = String(e.message || e); }
+}
+
+function speakBrowser(text) {
   if (!('speechSynthesis' in window)) return;
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -235,8 +327,9 @@ function speak(text) {
 }
 
 function listen() {
-  if (!SR) { $('status').textContent = 'Speech recognition is not supported in this browser (try Chrome, Edge or Safari).'; talkMode = false; syncTalk(); return; }
+  if (!localMode() && !SR) { $('status').textContent = 'Speech recognition is not supported in this browser (try Chrome, Edge or Safari).'; talkMode = false; syncTalk(); return; }
   if (busy || wantListen) return;
+  if (localMode()) return listenLocal();
   wantListen = true; spoken = ''; $('status').textContent = '';
   startRec();
 }
@@ -267,11 +360,11 @@ function startRec() {
   try { rec.start(); setMic(true); } catch { rec = null; }
 }
 function stopRec() {
-  wantListen = false; clearTimeout(silenceTimer);
+  wantListen = false; clearTimeout(silenceTimer); cancelLocal();
   if (rec) { rec.onresult = rec.onend = null; try { rec.abort(); } catch {} rec = null; }
   spoken = ''; setMic(false);
 }
-function setMic(on) { $('mic').classList.toggle('active', on); $('mic').textContent = on ? '🎤 Listening…' : '🎤 Speak'; }
+function setMic(on, label) { $('mic').classList.toggle('active', on); $('mic').textContent = on ? (label || '🎤 Listening…') : '🎤 Speak'; }
 function syncAuto() {
   $('auto').classList.toggle('active', cfg.autoSend);
   $('auto').textContent = cfg.autoSend ? '⏱ Auto-send: on' : '⏱ Auto-send: off';
@@ -281,11 +374,12 @@ function syncAuto() {
 $('auto').onclick = () => { cfg.autoSend = !cfg.autoSend; save('cfg', cfg); syncAuto(); if (!cfg.autoSend) clearTimeout(silenceTimer); };
 $('pause').onchange = () => { cfg.pauseSecs = Number($('pause').value); save('cfg', cfg); };
 function syncTalk() { $('talk').classList.toggle('active', talkMode); $('talk').textContent = talkMode ? '⏹ Stop conversation' : '🗣 Conversation mode'; }
-$('mic').onclick = () => { if (wantListen) stopRec(); else listen(); };
+$('mic').onclick = () => { unlockAudio(); if (wantListen) (lr ? finishLocal(false) : stopRec()); else listen(); };
 $('talk').onclick = () => {
+  unlockAudio();
   talkMode = !talkMode; syncTalk();
   if (talkMode) { const last = [...document.querySelectorAll('.msg.ai')].pop(); last ? speak(last.firstChild.textContent) : listen(); }
-  else { speechSynthesis.cancel(); stopRec(); }
+  else { speechSynthesis.cancel(); player.pause(); stopRec(); }
 };
 if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
@@ -356,13 +450,14 @@ function greet() {
 }
 
 function send() {
+  if (lr) return finishLocal(true);   // still recording: transcribe what was said, then send
   const t = $('input').value.trim();
   if (!t) return;
   stopRec();
   $('input').value = '';
   ask(t);
 }
-$('send').onclick = send;
+$('send').onclick = () => { unlockAudio(); send(); };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
 function restoreLog() {
@@ -416,7 +511,7 @@ function refreshUI() {
   if (!$('view-cards').classList.contains('hidden')) nextCard();
 }
 (async function init() {
-  if (SYNC) await pull();
+  if (SYNC) { await pull(); try { voice = await (await fetch('/voice')).json(); } catch {} }
   fillSettings(); updateDue(); syncAuto();
   if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) show('settings');
   else if (history.length) restoreLog();

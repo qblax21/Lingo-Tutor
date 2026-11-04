@@ -4,7 +4,7 @@ import json, subprocess, sys, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PORT = 8000
+PORT = 8090
 OLLAMA = "http://127.0.0.1:11434"
 HTML = Path(__file__).with_name("index.html")
 DATA = Path(__file__).with_name("data.json")  # your cards, chat and settings; git-ignored

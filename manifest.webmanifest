@@ -1,0 +1,12 @@
+{
+  "name": "Lingo Tutor",
+  "short_name": "Lingo",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#161615",
+  "theme_color": "#6d5dfc",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/logo.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

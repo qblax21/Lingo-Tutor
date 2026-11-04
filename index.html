@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lingo Tutor</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#6d5dfc">
+<style>
+  :root { --bg:#f7f6f2; --card:#fff; --ink:#1d1d1b; --mute:#6b6b66; --line:#e3e1da; --accent:#2f6fed; --good:#1f8a4c; --bad:#c2410c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161615; --card:#222221; --ink:#eeede8; --mute:#9a9992; --line:#33332f; --accent:#6f9bff; --good:#4cc380; --bad:#f08a55; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,sans-serif; }
+  header { display:flex; gap:8px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:18px; margin:0 auto 0 0; }
+  button, select, input, textarea { font:inherit; color:inherit; }
+  button { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.active { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:12px; }
+  label { display:block; font-size:13px; color:var(--mute); margin:10px 0 4px; }
+  input, select, textarea { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+  #log { display:flex; flex-direction:column; gap:10px; margin-bottom:12px; min-height:200px; }
+  .msg { padding:10px 14px; border-radius:14px; max-width:88%; white-space:pre-wrap; }
+  .me { align-self:flex-end; background:var(--accent); color:#fff; }
+  .ai { align-self:flex-start; background:var(--card); border:1px solid var(--line); }
+  .note { font-size:14px; color:var(--mute); margin-top:6px; white-space:normal; }
+  .fix { color:var(--bad); }
+  .words span { display:inline-block; margin:4px 6px 0 0; padding:2px 8px; border:1px dashed var(--line); border-radius:999px; cursor:pointer; font-size:14px; color:var(--ink); }
+  .words span:hover { border-color:var(--accent); }
+  .row { display:flex; gap:8px; }
+  .hidden { display:none; }
+  .flash { text-align:center; padding:32px 16px; }
+  .flash .big { font-size:28px; margin-bottom:8px; }
+  .err { color:var(--bad); font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><img src="logo.svg" alt="" width="28" height="28" style="vertical-align:-7px;margin-right:8px;border-radius:7px">Lingo Tutor</h1>
+  <button id="tab-chat" class="active">Chat</button>
+  <button id="tab-cards">Cards <span id="due"></span></button>
+  <button id="tab-settings">Settings</button>
+</header>
+<main>
+  <section id="view-settings" class="hidden">
+    <div class="card">
+      <label>AI provider</label>
+      <select id="provider">
+        <option value="ollama">Local model (Ollama) — free</option>
+        <option value="anthropic">Anthropic API — paid</option>
+      </select>
+      <label>Ollama model (run <code>ollama pull</code> on it first)</label>
+      <input id="ollamaModel" placeholder="qwen2.5:7b">
+      <label>Anthropic API key (only for the paid option; stored in this browser)</label>
+      <input id="key" type="password" placeholder="sk-ant-...">
+      <label>I want to learn</label>
+      <input id="target" placeholder="e.g. Spanish">
+      <label>My language</label>
+      <input id="native" placeholder="e.g. English">
+      <label>Level</label>
+      <select id="level"><option>Beginner</option><option>Elementary</option><option>Intermediate</option><option>Advanced</option></select>
+      <label>Scenario (optional)</label>
+      <input id="scenario" placeholder="e.g. ordering at a café, job interview, free chat">
+      <label>Model</label>
+      <select id="model">
+        <option value="claude-haiku-5-5">Haiku 5.5 (fast, cheap)</option>
+        <option value="claude-sonnet-5-5">Sonnet 5.5 (smarter)</option>
+      </select>
+      <p><button id="save" class="primary">Save</button> <button id="reset">Clear chat</button></p>
+    </div>
+  </section>
+
+  <section id="view-chat">
+    <div id="log"></div>
+    <div class="row">
+      <textarea id="input" rows="2" placeholder="Write in your target language…"></textarea>
+      <button id="send" class="primary">Send</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="mic" title="Speak one message">🎤 Speak</button>
+      <button id="talk" title="Hands-free: tutor speaks, then listens for you">🗣 Conversation mode</button>
+    </div>
+    <p id="status" class="err"></p>
+  </section>
+
+  <section id="view-cards" class="hidden">
+    <div id="cardbox" class="card flash"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+let cfg = Object.assign(
+  { provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
+  load('cfg', {}));
+let history = load('history', []);   // {role, content} for the API
+let cards = load('cards', []);       // {front, back, box, due}
+let busy = false;
+
+// ---------- tabs ----------
+function show(tab) {
+  for (const t of ['chat','cards','settings']) {
+    $('view-'+t).classList.toggle('hidden', t !== tab);
+    $('tab-'+t).classList.toggle('active', t === tab);
+  }
+  if (tab === 'cards') nextCard();
+}
+$('tab-chat').onclick = () => show('chat');
+$('tab-cards').onclick = () => show('cards');
+$('tab-settings').onclick = () => show('settings');
+
+// ---------- settings ----------
+function fillSettings() { for (const k of Object.keys(cfg)) $(k).value = cfg[k]; }
+$('save').onclick = () => {
+  for (const k of Object.keys(cfg)) cfg[k] = $(k).value.trim();
+  save('cfg', cfg);
+  show('chat');
+  if (!history.length) greet();
+};
+$('reset').onclick = () => { history = []; save('history', history); $('log').innerHTML = ''; greet(); show('chat'); };
+
+// ---------- chat ----------
+function system() {
+  return `You are a friendly, patient ${cfg.target} language tutor for a ${cfg.level} learner whose native language is ${cfg.native}.
+${cfg.scenario ? `Role-play scenario: ${cfg.scenario}.` : 'Hold a natural conversation on everyday topics.'}
+Always reply with ONLY a JSON object, no markdown fences, with these keys:
+- "reply": your next conversational message, written in ${cfg.target} at ${cfg.level} level (short, 1-3 sentences, end with a question to keep the user talking).
+- "translation": ${cfg.native} translation of your reply.
+- "correction": if the user's last message had mistakes, the corrected sentence in ${cfg.target} plus a one-line explanation in ${cfg.native}; otherwise an empty string.
+- "vocab": array of up to 3 useful new words/phrases from your reply, each {"word": "...", "meaning": "..."} (meaning in ${cfg.native}).
+If the user writes in ${cfg.native}, help them say it in ${cfg.target} and continue the conversation.`;
+}
+
+function addMsg(cls, text, extra) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  if (extra) d.appendChild(extra);
+  $('log').appendChild(d);
+  d.scrollIntoView({ block:'end', behavior:'smooth' });
+  return d;
+}
+
+function renderAI(obj) {
+  const box = document.createElement('div');
+  box.className = 'note';
+  if (obj.correction) {
+    const c = document.createElement('div');
+    c.className = 'fix';
+    c.textContent = '✎ ' + obj.correction;
+    box.appendChild(c);
+  }
+  if (obj.translation) {
+    const t = document.createElement('div');
+    t.textContent = obj.translation;
+    box.appendChild(t);
+  }
+  if (obj.vocab?.length) {
+    const w = document.createElement('div');
+    w.className = 'words';
+    for (const v of obj.vocab) {
+      const s = document.createElement('span');
+      s.textContent = `+ ${v.word} — ${v.meaning}`;
+      s.title = 'Add to flashcards';
+      s.onclick = () => { addCard(v.word, v.meaning); s.remove(); };
+      w.appendChild(s);
+    }
+    box.appendChild(w);
+  }
+  addMsg('ai', obj.reply, box);
+  if (talkMode && obj.reply) speak(obj.reply);
+}
+
+// ---------- voice ----------
+const LANGS = { spanish:'es-ES', french:'fr-FR', german:'de-DE', italian:'it-IT', portuguese:'pt-BR', japanese:'ja-JP',
+  korean:'ko-KR', chinese:'zh-CN', mandarin:'zh-CN', russian:'ru-RU', arabic:'ar-SA', hindi:'hi-IN', dutch:'nl-NL',
+  turkish:'tr-TR', polish:'pl-PL', swedish:'sv-SE', greek:'el-GR', english:'en-US' };
+const langCode = () => LANGS[cfg.target.toLowerCase()] || 'en-US';
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let talkMode = false, rec = null;
+
+function speak(text) {
+  if (!('speechSynthesis' in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = langCode();
+  const v = speechSynthesis.getVoices().find(v => v.lang.replace('_','-').startsWith(u.lang.slice(0,2)));
+  if (v) u.voice = v;
+  u.onend = () => { if (talkMode) listen(); };
+  speechSynthesis.speak(u);
+}
+
+function listen() {
+  if (!SR) { $('status').textContent = 'Speech recognition is not supported in this browser (try Chrome, Edge or Safari).'; talkMode = false; syncTalk(); return; }
+  if (busy || rec) return;
+  rec = new SR();
+  rec.lang = langCode();
+  rec.interimResults = false;
+  rec.onresult = e => { const t = e.results[0][0].transcript; rec = null; setMic(false); ask(t); };
+  rec.onerror = e => { rec = null; setMic(false); if (e.error !== 'no-speech' && e.error !== 'aborted') { $('status').textContent = 'Mic error: ' + e.error + (location.protocol === 'http:' && location.hostname !== 'localhost' ? ' (browsers only allow the mic on https:// or localhost)' : ''); talkMode = false; syncTalk(); } };
+  rec.onend = () => { const was = rec; rec = null; setMic(false); if (was && talkMode && !busy && !speechSynthesis.speaking) setTimeout(listen, 300); };
+  try { rec.start(); setMic(true); $('status').textContent = ''; } catch { rec = null; }
+}
+function setMic(on) { $('mic').classList.toggle('active', on); $('mic').textContent = on ? '🎤 Listening…' : '🎤 Speak'; }
+function syncTalk() { $('talk').classList.toggle('active', talkMode); $('talk').textContent = talkMode ? '⏹ Stop conversation' : '🗣 Conversation mode'; }
+$('mic').onclick = () => { if (rec) rec.stop(); else listen(); };
+$('talk').onclick = () => {
+  talkMode = !talkMode; syncTalk();
+  if (talkMode) { const last = [...document.querySelectorAll('.msg.ai')].pop(); last ? speak(last.firstChild.textContent) : listen(); }
+  else { speechSynthesis.cancel(); if (rec) rec.stop(); }
+};
+if ('speechSynthesis' in window) speechSynthesis.getVoices();
+
+function parse(text) {
+  const m = text.match(/\{[\s\S]*\}/);
+  try { return JSON.parse(m ? m[0] : text); } catch { return { reply: text }; }
+}
+
+async function ask(userText) {
+  if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) { show('settings'); return; }
+  if (busy) return;
+  busy = true; $('send').disabled = true; $('status').textContent = '';
+  if (userText) {
+    addMsg('me', userText);
+    history.push({ role:'user', content:userText });
+  }
+  const wait = addMsg('ai', '…');
+  try {
+    let text;
+    if (cfg.provider === 'ollama') {
+      let res;
+      try {
+        // served by server.py -> same-origin proxy; opened as a file -> talk to Ollama directly
+        const base = location.protocol.startsWith('http') ? '' : 'http://localhost:11434';
+        res = await fetch(base + '/api/chat', {
+          method:'POST',
+          body: JSON.stringify({
+            model:cfg.ollamaModel, stream:false, format:'json',
+            messages:[{ role:'system', content:system() }, ...history.slice(-30)]
+          })
+        });
+      } catch { throw new Error("Can't reach Ollama at localhost:11434. Is it installed and running? (see README.txt)"); }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      text = data.message.content;
+    } else {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method:'POST',
+        headers:{
+          'content-type':'application/json',
+          'x-api-key':cfg.key,
+          'anthropic-version':'2023-06-01',
+          'anthropic-dangerous-direct-browser-access':'true'
+        },
+        body: JSON.stringify({ model:cfg.model, max_tokens:700, system:system(), messages:history.slice(-30) })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || res.statusText);
+      text = data.content.map(b => b.text || '').join('');
+    }
+    wait.remove();
+    renderAI(parse(text));
+    history.push({ role:'assistant', content:text });
+    save('history', history);
+  } catch (e) {
+    wait.remove();
+    if (userText) history.pop();
+    $('status').textContent = 'Error: ' + e.message;
+  }
+  busy = false; $('send').disabled = false;
+}
+
+// seed history with a hidden opener so the tutor speaks first
+function greet() {
+  history = [{ role:'user', content:'(Start the conversation with a short greeting and a first question.)' }];
+  busy = false;
+  ask(null);
+}
+
+function send() {
+  const t = $('input').value.trim();
+  if (!t) return;
+  $('input').value = '';
+  ask(t);
+}
+$('send').onclick = send;
+$('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+function restoreLog() {
+  for (const m of history.slice(1)) {
+    if (m.role === 'user') addMsg('me', m.content);
+    else renderAI(parse(m.content));
+  }
+}
+
+// ---------- flashcards (Leitner boxes) ----------
+const DAYS = [0, 1, 3, 7, 16, 35];
+function addCard(front, back) {
+  if (cards.some(c => c.front === front)) return;
+  cards.push({ front, back, box:0, due:Date.now() });
+  save('cards', cards); updateDue();
+}
+function dueCards() { return cards.filter(c => c.due <= Date.now()); }
+function updateDue() { const n = dueCards().length; $('due').textContent = n ? `(${n})` : ''; }
+
+let current = null;
+function nextCard() {
+  const box = $('cardbox');
+  const due = dueCards();
+  if (!due.length) {
+    current = null;
+    box.innerHTML = `<div class="big">🎉</div><p>${cards.length ? 'Nothing due right now. Come back later!' : 'No cards yet. Tap a word under a tutor message to add it.'}</p>`;
+    return;
+  }
+  current = due[Math.floor(Math.random() * due.length)];
+  box.innerHTML = `<div class="big"></div><p class="note">What does this mean?</p><p><button id="reveal" class="primary">Show answer</button></p>`;
+  box.querySelector('.big').textContent = current.front;
+  $('reveal').onclick = () => {
+    box.innerHTML = `<div class="big"></div><div class="note"></div><p class="row" style="justify-content:center"><button id="no">Missed it</button><button id="yes" class="primary">Got it</button></p>`;
+    box.querySelector('.big').textContent = current.front;
+    box.querySelector('.note').textContent = current.back;
+    $('no').onclick = () => grade(false);
+    $('yes').onclick = () => grade(true);
+  };
+}
+function grade(ok) {
+  current.box = ok ? Math.min(current.box + 1, DAYS.length - 1) : 0;
+  current.due = Date.now() + (ok ? DAYS[current.box] * 864e5 : 60e3);
+  save('cards', cards); updateDue(); nextCard();
+}
+
+// ---------- init ----------
+fillSettings();
+updateDue();
+if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) show('settings');
+else if (history.length) restoreLog();
+else greet();
+</script>
+</body>
+</html>

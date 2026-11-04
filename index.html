@@ -89,6 +89,13 @@
       <button id="mic" title="Speak one message">🎤 Speak</button>
       <button id="talk" title="Hands-free: tutor speaks, then listens for you">🗣 Conversation mode</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <button id="auto" title="Send automatically after you stop talking">⏱ Auto-send</button>
+      <select id="pause" style="width:auto" title="How long to wait in silence before sending">
+        <option value="2">after 2s silence</option><option value="3">after 3s silence</option>
+        <option value="5">after 5s silence</option><option value="8">after 8s silence</option>
+      </select>
+    </div>
     <p id="status" class="err"></p>
   </section>
 
@@ -127,7 +134,7 @@ async function pull() {
 }
 
 let cfg = Object.assign(
-  { provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
+  { autoSend:true, pauseSecs:3, provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
   load('cfg', {}));
 let history = load('history', []);   // {role, content} for the API
 let cards = load('cards', []);       // {front, back, box, due}
@@ -146,9 +153,10 @@ $('tab-cards').onclick = () => show('cards');
 $('tab-settings').onclick = () => show('settings');
 
 // ---------- settings ----------
-function fillSettings() { for (const k of Object.keys(cfg)) $(k).value = cfg[k]; }
+const formKeys = () => Object.keys(cfg).filter(k => $(k) && $(k).tagName !== 'BUTTON');   // autoSend/pauseSecs live on the chat screen
+function fillSettings() { for (const k of formKeys()) $(k).value = cfg[k]; }
 $('save').onclick = () => {
-  for (const k of Object.keys(cfg)) cfg[k] = $(k).value.trim();
+  for (const k of formKeys()) cfg[k] = $(k).value.trim();
   save('cfg', cfg);
   show('chat');
   if (!history.length) greet();
@@ -213,7 +221,7 @@ const LANGS = { spanish:'es-ES', french:'fr-FR', german:'de-DE', italian:'it-IT'
   turkish:'tr-TR', polish:'pl-PL', swedish:'sv-SE', greek:'el-GR', english:'en-US' };
 const langCode = () => LANGS[cfg.target.toLowerCase()] || 'en-US';
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let talkMode = false, rec = null;
+let talkMode = false, rec = null, wantListen = false, spoken = '', silenceTimer;
 
 function speak(text) {
   if (!('speechSynthesis' in window)) return;
@@ -228,22 +236,56 @@ function speak(text) {
 
 function listen() {
   if (!SR) { $('status').textContent = 'Speech recognition is not supported in this browser (try Chrome, Edge or Safari).'; talkMode = false; syncTalk(); return; }
-  if (busy || rec) return;
+  if (busy || wantListen) return;
+  wantListen = true; spoken = ''; $('status').textContent = '';
+  startRec();
+}
+// Keeps listening through pauses (browsers cut recognition off on their own), collecting what you say
+// in the text box. With auto-send on, a long enough silence sends it; with it off, you press Send.
+function startRec() {
   rec = new SR();
   rec.lang = langCode();
-  rec.interimResults = false;
-  rec.onresult = e => { const t = e.results[0][0].transcript; rec = null; setMic(false); ask(t); };
-  rec.onerror = e => { rec = null; setMic(false); if (e.error !== 'no-speech' && e.error !== 'aborted') { $('status').textContent = 'Mic error: ' + e.error + (location.protocol === 'http:' && location.hostname !== 'localhost' ? ' (browsers only allow the mic on https:// or localhost)' : ''); talkMode = false; syncTalk(); } };
-  rec.onend = () => { const was = rec; rec = null; setMic(false); if (was && talkMode && !busy && !speechSynthesis.speaking) setTimeout(listen, 300); };
-  try { rec.start(); setMic(true); $('status').textContent = ''; } catch { rec = null; }
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) spoken += r[0].transcript + ' '; else interim += r[0].transcript;
+    }
+    $('input').value = (spoken + interim).trim();
+    clearTimeout(silenceTimer);
+    if (cfg.autoSend && $('input').value) silenceTimer = setTimeout(send, cfg.pauseSecs * 1000);
+  };
+  rec.onerror = e => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    stopRec();
+    $('status').textContent = 'Mic error: ' + e.error + (location.protocol === 'http:' && location.hostname !== 'localhost' ? ' (browsers only allow the mic on https:// or localhost)' : '');
+    talkMode = false; syncTalk();
+  };
+  rec.onend = () => { rec = null; if (wantListen) setTimeout(() => { if (wantListen && !rec) startRec(); }, 200); };
+  try { rec.start(); setMic(true); } catch { rec = null; }
+}
+function stopRec() {
+  wantListen = false; clearTimeout(silenceTimer);
+  if (rec) { rec.onresult = rec.onend = null; try { rec.abort(); } catch {} rec = null; }
+  spoken = ''; setMic(false);
 }
 function setMic(on) { $('mic').classList.toggle('active', on); $('mic').textContent = on ? '🎤 Listening…' : '🎤 Speak'; }
+function syncAuto() {
+  $('auto').classList.toggle('active', cfg.autoSend);
+  $('auto').textContent = cfg.autoSend ? '⏱ Auto-send: on' : '⏱ Auto-send: off';
+  $('pause').classList.toggle('hidden', !cfg.autoSend);
+  $('pause').value = String(cfg.pauseSecs);
+}
+$('auto').onclick = () => { cfg.autoSend = !cfg.autoSend; save('cfg', cfg); syncAuto(); if (!cfg.autoSend) clearTimeout(silenceTimer); };
+$('pause').onchange = () => { cfg.pauseSecs = Number($('pause').value); save('cfg', cfg); };
 function syncTalk() { $('talk').classList.toggle('active', talkMode); $('talk').textContent = talkMode ? '⏹ Stop conversation' : '🗣 Conversation mode'; }
-$('mic').onclick = () => { if (rec) rec.stop(); else listen(); };
+$('mic').onclick = () => { if (wantListen) stopRec(); else listen(); };
 $('talk').onclick = () => {
   talkMode = !talkMode; syncTalk();
   if (talkMode) { const last = [...document.querySelectorAll('.msg.ai')].pop(); last ? speak(last.firstChild.textContent) : listen(); }
-  else { speechSynthesis.cancel(); if (rec) rec.stop(); }
+  else { speechSynthesis.cancel(); stopRec(); }
 };
 if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
@@ -316,6 +358,7 @@ function greet() {
 function send() {
   const t = $('input').value.trim();
   if (!t) return;
+  stopRec();
   $('input').value = '';
   ask(t);
 }
@@ -374,13 +417,13 @@ function refreshUI() {
 }
 (async function init() {
   if (SYNC) await pull();
-  fillSettings(); updateDue();
+  fillSettings(); updateDue(); syncAuto();
   if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) show('settings');
   else if (history.length) restoreLog();
   else greet();
   // pick up changes made on another device when you come back to this tab
   document.addEventListener('visibilitychange', async () => {
-    if (SYNC && !document.hidden && !busy && !rec && await pull()) refreshUI();
+    if (SYNC && !document.hidden && !busy && !wantListen && await pull()) { refreshUI(); syncAuto(); }
   });
 })();
 

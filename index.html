@@ -74,6 +74,8 @@
         <option value="claude-sonnet-5-5">Sonnet 5.5 (smarter)</option>
       </select>
       <p><button id="save" class="primary">Save</button> <button id="reset">Clear chat</button></p>
+      <label>Backup (chat, cards, settings — not your API key)</label>
+      <p><button id="export">Export</button> <label style="display:inline"><span class="btn" style="border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer;color:var(--ink);font-size:16px">Import</span><input id="import" type="file" accept="application/json" hidden></label></p>
     </div>
   </section>
 
@@ -98,7 +100,31 @@
 <script>
 const $ = id => document.getElementById(id);
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
-const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+const SYNC = location.protocol.startsWith('http');   // served by server.py -> keep data on the PC
+let pushTimer;
+const save = (k, v) => { localStorage.setItem(k, JSON.stringify(v)); pushSoon(); };
+function snapshot() { const { key, ...safe } = cfg; return { cfg:safe, history, cards }; }   // API key never leaves the device
+function pushSoon() {
+  if (!SYNC) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => fetch('/data', { method:'PUT', body:JSON.stringify(snapshot()) }).catch(() => {}), 300);
+}
+function applyData(d) {
+  if (d.cfg) cfg = Object.assign(cfg, d.cfg, { key:cfg.key });
+  if (d.history) history = d.history;
+  if (d.cards) cards = d.cards;
+  localStorage.setItem('cfg', JSON.stringify(cfg));
+  localStorage.setItem('history', JSON.stringify(history));
+  localStorage.setItem('cards', JSON.stringify(cards));
+}
+async function pull() {
+  try {
+    const d = await (await fetch('/data', { cache:'no-store' })).json();
+    if (d.cards || d.history) { applyData(d); return true; }
+    pushSoon();   // server is empty: seed it from this device
+  } catch {}
+  return false;
+}
 
 let cfg = Object.assign(
   { provider:'ollama', ollamaModel:'qwen2.5:7b', key:'', target:'', native:'English', level:'Beginner', scenario:'', model:'claude-haiku-5-5' },
@@ -340,11 +366,36 @@ function grade(ok) {
 }
 
 // ---------- init ----------
-fillSettings();
-updateDue();
-if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) show('settings');
-else if (history.length) restoreLog();
-else greet();
+function refreshUI() {
+  fillSettings(); updateDue();
+  $('log').innerHTML = '';
+  restoreLog();
+  if (!$('view-cards').classList.contains('hidden')) nextCard();
+}
+(async function init() {
+  if (SYNC) await pull();
+  fillSettings(); updateDue();
+  if ((cfg.provider === 'anthropic' && !cfg.key) || !cfg.target) show('settings');
+  else if (history.length) restoreLog();
+  else greet();
+  // pick up changes made on another device when you come back to this tab
+  document.addEventListener('visibilitychange', async () => {
+    if (SYNC && !document.hidden && !busy && !rec && await pull()) refreshUI();
+  });
+})();
+
+// ---------- backup ----------
+$('export').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(snapshot(), null, 2)], { type:'application/json' }));
+  a.download = 'lingo-tutor-backup.json';
+  a.click();
+};
+$('import').onchange = async e => {
+  try { applyData(JSON.parse(await e.target.files[0].text())); pushSoon(); refreshUI(); show('chat'); }
+  catch { $('status').textContent = 'That file is not a valid backup.'; }
+  e.target.value = '';
+};
 </script>
 </body>
 </html>

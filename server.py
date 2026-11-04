@@ -1,12 +1,13 @@
 """Serves index.html and forwards /api/* to the local Ollama, so only this one port is exposed.
 Listens on localhost and the Tailscale address only (not your regular Wi-Fi/LAN)."""
-import subprocess, sys, threading, urllib.request, urllib.error
+import json, subprocess, sys, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = 8000
 OLLAMA = "http://127.0.0.1:11434"
 HTML = Path(__file__).with_name("index.html")
+DATA = Path(__file__).with_name("data.json")  # your cards, chat and settings; git-ignored
 STATIC = {
     "index.html": "text/html; charset=utf-8",
     "logo.svg": "image/svg+xml",
@@ -25,11 +26,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        name = "index.html" if self.path == "/" else self.path.lstrip("/")
+        if self.path == "/data":
+            return self._send(200, DATA.read_bytes() if DATA.exists() else b"{}")
+        name ="index.html" if self.path == "/" else self.path.lstrip("/")
         if name in STATIC and (HTML.parent / name).exists():
             self._send(200, (HTML.parent / name).read_bytes(), STATIC[name])
         else:
             self._send(404, b"not found", "text/plain")
+
+    def do_PUT(self):
+        if self.path != "/data":
+            return self._send(404, b"not found", "text/plain")
+        n = int(self.headers.get("Content-Length", 0))
+        if n > 5_000_000:
+            return self._send(413, b'{"error":"too large"}')
+        body = self.rfile.read(n)
+        try:
+            json.loads(body)
+        except ValueError:
+            return self._send(400, b'{"error":"bad json"}')
+        tmp = DATA.with_suffix(".tmp")
+        tmp.write_bytes(body)
+        tmp.replace(DATA)  # atomic, so a crash can't leave half a file
+        self._send(200, b"{}")
 
     def do_POST(self):
         if not self.path.startswith("/api/"):

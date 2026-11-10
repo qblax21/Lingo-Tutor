@@ -55,25 +55,69 @@ def _add_cuda_dlls():
             os.environ["PATH"] = str(d) + os.pathsep + os.environ["PATH"]
 
 
-def transcribe(audio, lang):
+def _load_whisper():  # call with _lock held
     global _whisper
+    if _whisper is None:
+        _add_cuda_dlls()
+        from faster_whisper import WhisperModel
+        try:
+            _whisper = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
+        except Exception as e:
+            print("GPU unavailable for Whisper, using CPU:", e, flush=True)
+            _whisper = WhisperModel("small", device="cpu", compute_type="int8")
+    return _whisper
+
+
+def transcribe(audio, lang):
     import io
     with _lock:
-        if _whisper is None:
-            _add_cuda_dlls()
-            from faster_whisper import WhisperModel
-            try:
-                _whisper = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-            except Exception as e:
-                print("GPU unavailable for Whisper, using CPU:", e, flush=True)
-                _whisper = WhisperModel("small", device="cpu", compute_type="int8")
-        segs, _ = _whisper.transcribe(io.BytesIO(audio), language=iso(lang), vad_filter=True, beam_size=5)
+        segs, _ = _load_whisper().transcribe(io.BytesIO(audio), language=iso(lang), vad_filter=True, beam_size=5)
         return " ".join(s.text.strip() for s in segs).strip()
 
 
-def synthesize(text, lang):
+def _tokens(text):
+    import re
+    return [t for t in re.findall(r"[^\W\d_]+(?:['’-][^\W\d_]+)*|\d+", text.casefold())]
+
+
+def score_pronunciation(audio, lang, target):
+    """Compare what Whisper hears against the target sentence, word by word.
+    Whisper tends to 'autocorrect' mumbling into plausible words, so this is a clarity check, not a phoneme-level grade."""
+    import io, difflib
+    with _lock:
+        segs, _ = _load_whisper().transcribe(io.BytesIO(audio), language=iso(lang), vad_filter=True, beam_size=5,
+                                             word_timestamps=True, condition_on_previous_text=False, temperature=0)
+        heard = [(t, w.probability) for s in segs for w in (s.words or []) for t in _tokens(w.word)]
+    want = _tokens(target)
+    hw = [h for h, _ in heard]
+    out, extra = [], []
+    for op, a1, a2, b1, b2 in difflib.SequenceMatcher(None, want, hw, autojunk=False).get_opcodes():
+        if op == "equal":
+            for i, j in zip(range(a1, a2), range(b1, b2)):
+                p = heard[j][1]
+                out.append({"word": want[i], "heard": hw[j], "status": "ok" if p >= 0.6 else "unsure", "prob": round(p, 2)})
+        elif op == "replace":
+            for k in range(max(a2 - a1, b2 - b1)):
+                i, j = a1 + k, b1 + k
+                if i < a2 and j < b2:
+                    r = difflib.SequenceMatcher(None, want[i], hw[j]).ratio()
+                    out.append({"word": want[i], "heard": hw[j], "status": "close" if r >= 0.7 else "wrong", "prob": round(heard[j][1], 2)})
+                elif i < a2:
+                    out.append({"word": want[i], "heard": "", "status": "missed", "prob": 0})
+                else:
+                    extra.append(hw[j])
+        elif op == "delete":
+            out += [{"word": w, "heard": "", "status": "missed", "prob": 0} for w in want[a1:a2]]
+        else:
+            extra += hw[b1:b2]
+    pts = {"ok": 1, "unsure": 0.75, "close": 0.5, "wrong": 0, "missed": 0}
+    score = round(100 * sum(pts[w["status"]] for w in out) / max(len(out), 1))
+    return {"words": out, "heard": " ".join(hw), "extra": extra, "score": score}
+
+
+def synthesize(text, lang, slow=False):
     import io, wave
-    from piper import PiperVoice
+    from piper import PiperVoice, SynthesisConfig
     code = iso(lang)
     pref = "pt_BR" if code == "pt" and "braz" in _norm(lang) else PREFER.get(code, "\0")
     models = sorted(VOICE_DIR.glob(f"{code}_*.onnx"), key=lambda p: not p.name.startswith(pref)) if code else []
@@ -85,7 +129,7 @@ def synthesize(text, lang):
             voice = _piper[models[0]] = PiperVoice.load(str(models[0]))
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
-            voice.synthesize_wav(text, w)
+            voice.synthesize_wav(text, w, syn_config=SynthesisConfig(length_scale=1.5) if slow else None)
     return buf.getvalue()
 
 
@@ -135,10 +179,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"text": transcribe(data, lang)}).encode())
             except Exception as e:
                 return self._send(503, json.dumps({"error": f"Speech-to-text unavailable: {e}"}).encode())
+        if path.path == "/pronounce":
+            q = parse_qs(path.query)
+            try:
+                res = score_pronunciation(data, q.get("lang", [None])[0], q.get("target", [""])[0])
+                return self._send(200, json.dumps(res).encode())
+            except Exception as e:
+                return self._send(503, json.dumps({"error": f"Pronunciation check unavailable: {e}"}).encode())
         if path.path == "/tts":
             try:
                 req = json.loads(data)
-                return self._send(200, synthesize(req["text"], req.get("lang", "")), "audio/wav")
+                return self._send(200, synthesize(req["text"], req.get("lang", ""), bool(req.get("slow"))), "audio/wav")
             except Exception as e:
                 return self._send(503, json.dumps({"error": f"Text-to-speech unavailable: {e}"}).encode())
         if not self.path.startswith("/api/"):

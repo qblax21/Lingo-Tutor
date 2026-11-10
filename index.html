@@ -36,6 +36,15 @@
   .words span:hover { border-color:var(--accent); }
   .row { display:flex; gap:8px; }
   .hidden { display:none; }
+  header { flex-wrap:wrap; }
+  :root { --warn:#c98200; }
+  @media (prefers-color-scheme: dark) { :root { --warn:#f0b43c; } }
+  .score { font-size:40px; font-weight:700; margin:8px 0; }
+  .pw { display:inline-block; margin:4px 6px 0 0; padding:4px 10px; border-radius:8px; border:2px solid; font-size:18px; }
+  .pw.ok { color:var(--good); border-color:var(--good); }
+  .pw.unsure, .pw.close { color:var(--warn); border-color:var(--warn); }
+  .pw.wrong, .pw.missed { color:var(--bad); border-color:var(--bad); }
+  .pw.missed { text-decoration:line-through; }
   .flash { text-align:center; padding:32px 16px; }
   .flash .big { font-size:28px; margin-bottom:8px; }
   .err { color:var(--bad); font-size:14px; }
@@ -46,6 +55,7 @@
   <h1><img src="logo.svg" alt="" width="28" height="28" style="vertical-align:-7px;margin-right:8px;border-radius:7px">Lingo Tutor</h1>
   <button id="tab-chat" class="active">Chat</button>
   <button id="tab-cards">Cards <span id="due"></span></button>
+  <button id="tab-pron">Pronounce</button>
   <button id="tab-settings">Settings</button>
 </header>
 <main>
@@ -104,6 +114,20 @@
     <p id="status" class="err"></p>
   </section>
 
+  <section id="view-pron" class="hidden">
+    <div class="card">
+      <label>Sentence to practice (tap 🎯 Practice under a tutor message, or type your own)</label>
+      <textarea id="ptarget" rows="2" placeholder="Type or pick a sentence…"></textarea>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap">
+        <button id="phear">🔊 Hear it</button>
+        <button id="pslow">🐢 Slower</button>
+        <button id="prec" class="primary">🎤 Record</button>
+      </div>
+      <p id="pstatus" class="note"></p>
+      <div id="presult"></div>
+    </div>
+  </section>
+
   <section id="view-cards" class="hidden">
     <div id="cardbox" class="card flash"></div>
   </section>
@@ -147,7 +171,7 @@ let busy = false;
 
 // ---------- tabs ----------
 function show(tab) {
-  for (const t of ['chat','cards','settings']) {
+  for (const t of ['chat','cards','pron','settings']) {
     $('view-'+t).classList.toggle('hidden', t !== tab);
     $('tab-'+t).classList.toggle('active', t === tab);
   }
@@ -155,6 +179,7 @@ function show(tab) {
 }
 $('tab-chat').onclick = () => show('chat');
 $('tab-cards').onclick = () => show('cards');
+$('tab-pron').onclick = () => show('pron');
 $('tab-settings').onclick = () => show('settings');
 
 // ---------- settings ----------
@@ -223,6 +248,12 @@ function renderAI(obj) {
     b.textContent = '🔊 Listen';
     b.onclick = () => { unlockAudio(); speak(obj.reply); };
     h.appendChild(b);
+    if (localMode()) {
+      const p = document.createElement('span');
+      p.textContent = '🎯 Practice';
+      p.onclick = () => practice(obj.reply);
+      h.appendChild(p);
+    }
     box.appendChild(h);
   }
   addMsg('ai', obj.reply, box);
@@ -314,6 +345,111 @@ async function finishLocal(thenSend) {
     if (thenSend) send();
   } catch (e) { $('status').textContent = String(e.message || e); }
 }
+
+// ---- pronunciation drill: say a sentence, get word-by-word feedback from Whisper ----
+let prec = null;   // while recording: { stop() }
+function practice(text) { $('ptarget').value = text; $('presult').innerHTML = ''; $('pstatus').textContent = ''; show('pron'); }
+
+async function playPron(slow) {
+  unlockAudio();
+  const text = $('ptarget').value.trim();
+  if (!text) return;
+  if (!localMode()) return speakBrowser(text);
+  try {
+    const r = await fetch('/tts', { method:'POST', body:JSON.stringify({ text, lang:cfg.target, slow }) });
+    if (!r.ok) throw new Error((await r.json()).error);
+    player.onended = null;
+    player.src = URL.createObjectURL(await r.blob());
+    await player.play();
+  } catch (e) { $('pstatus').textContent = String(e.message || e); }
+}
+
+async function recordOnce() {   // records until you pause (or tap Stop); resolves null if nothing was said
+  const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  const mr = new MediaRecorder(stream), chunks = [];
+  mr.ondataavailable = e => chunks.push(e.data);
+  const ctx = new (window.AudioContext || window.webkitAudioContext)(), an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Float32Array(an.fftSize);
+  return new Promise(resolve => {
+    let spoke = false, last = 0, noise = 0.01;
+    const start = Date.now();
+    const done = () => {
+      clearInterval(timer); prec = null;
+      mr.onstop = () => { stream.getTracks().forEach(t => t.stop()); ctx.close(); resolve(spoke ? new Blob(chunks, { type:mr.mimeType }) : null); };
+      try { mr.stop(); } catch { mr.onstop(); }
+    };
+    prec = { stop:done };
+    const timer = setInterval(() => {
+      an.getFloatTimeDomainData(buf);
+      let s = 0; for (const v of buf) s += v * v;
+      const rms = Math.sqrt(s / buf.length), now = Date.now();
+      if (now - start < 500) noise = Math.min(0.03, Math.max(noise, rms));
+      else if (rms > Math.max(0.02, noise * 2.5)) { spoke = true; last = now; }
+      if ((spoke && now - last > 1500) || (!spoke && now - start > 15000) || now - start > 30000) done();
+    }, 100);
+    mr.start();
+  });
+}
+
+async function checkPron() {
+  const target = $('ptarget').value.trim();
+  if (!target) { $('pstatus').textContent = 'Type or pick a sentence first.'; return; }
+  if (!localMode()) { $('pstatus').textContent = 'Pronunciation checking needs the local voice (open the PC server address and set Settings → Voice to Local).'; return; }
+  if (prec) { prec.stop(); return; }
+  stopRec(); player.pause();
+  let blob;
+  $('prec').textContent = '⏹ Stop'; $('pstatus').textContent = 'Listening… say the sentence, then pause.'; $('presult').innerHTML = '';
+  try { blob = await recordOnce(); }
+  catch (e) { $('prec').textContent = '🎤 Record'; $('pstatus').textContent = 'Mic unavailable: ' + (e.name || e) + ' (needs https:// or localhost, and mic permission)'; return; }
+  $('prec').textContent = '🎤 Record';
+  if (!blob) { $('pstatus').textContent = "I didn't hear anything — try again."; return; }
+  $('pstatus').textContent = 'Checking…';
+  try {
+    const r = await fetch('/pronounce?lang=' + encodeURIComponent(cfg.target) + '&target=' + encodeURIComponent(target), { method:'POST', body:blob });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    $('pstatus').textContent = '';
+    showPron(d, target);
+  } catch (e) { $('pstatus').textContent = String(e.message || e); }
+}
+
+function showPron(d, target) {
+  const box = $('presult');
+  box.innerHTML = '';
+  const sc = document.createElement('div');
+  sc.className = 'score';
+  sc.textContent = d.score + ' / 100';
+  box.appendChild(sc);
+  const words = document.createElement('div');
+  for (const w of d.words) {
+    const s = document.createElement('span');
+    s.className = 'pw ' + w.status;
+    s.textContent = w.word;
+    s.title = w.heard ? 'heard: ' + w.heard : 'not heard';
+    words.appendChild(s);
+  }
+  box.appendChild(words);
+  const n = document.createElement('p');
+  n.className = 'note';
+  n.textContent = 'I heard: “' + (d.heard || '…') + '”' + (d.extra.length ? '  (extra: ' + d.extra.join(' ') + ')' : '') +
+    '. Green = clear · orange = unclear or close · red = different or missed. Tap a word to see what I heard.';
+  box.appendChild(n);
+  const tricky = d.words.filter(w => w.status !== 'ok');
+  const row = document.createElement('div');
+  row.className = 'row';
+  if (tricky.length) {
+    const add = document.createElement('button');
+    add.textContent = '+ Add tricky words to cards';
+    add.onclick = () => { tricky.forEach(w => addCard(w.word, 'from: ' + target)); add.disabled = true; add.textContent = 'Added ✓'; };
+    row.appendChild(add);
+  }
+  box.appendChild(row);
+}
+$('phear').onclick = () => playPron(false);
+$('pslow').onclick = () => playPron(true);
+$('prec').onclick = checkPron;
 
 function speakBrowser(text) {
   if (!('speechSynthesis' in window)) return;
